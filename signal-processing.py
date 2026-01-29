@@ -1,117 +1,150 @@
-# -----------------------------
-# FIR Filter Simulation for impl0
-# Robust + Terminal Prints
-# -----------------------------
+import os
+import subprocess
+import platform
 
-class FIRFilter:
+# -------------------------------
+# UAD class for impl0
+# -------------------------------
+class Uad():
     def __init__(self):
-        self.coeffs = []
-        self.buffer = []
+        self.inst = "impl0"  # Day 4 only
+        self.is_windows = platform.system() == "Windows"
 
-    def set_coefficients(self, coeffs):
-        self.coeffs = coeffs
-        self.buffer = [0.0] * len(coeffs)
+    # --- Common Channel ---
+    def halt(self):
+        csr = self.read_CSR()
+        if csr is not None:
+            self.write_CSR(csr | (1 << 5))  # HALT=1
 
-    def filter(self, sample):
-        # Shift buffer: newest sample first
-        self.buffer = [sample] + self.buffer[:-1]
-        # Multiply each buffered value by its coefficient and sum
-        return sum(c * x for c, x in zip(self.coeffs, self.buffer))
+    # --- Configuration Channel ---
+    def read_CSR(self):
+        cmd = f'{self.inst}.exe cfg --address 0x0' if self.is_windows else f'./{self.inst} cfg --address 0x0'
+        try:
+            csr_bytes = subprocess.check_output(cmd, shell=True)
+            return int(csr_bytes.strip(), 16)
+        except:
+            print("error: interface unavailable, cannot read CSR")
+            return None
 
+    def write_CSR(self, value):
+        cmd = f'{self.inst}.exe cfg --address 0x0 --data {hex(value)}' if self.is_windows else f'./{self.inst} cfg --address 0x0 --data {hex(value)}'
+        return os.system(cmd)
 
-# Load coefficients from a .cfg file (ignore text, only take numbers)
-def load_coefficients(filename):
+    def write_register(self, address, value):
+        cmd = f'{self.inst}.exe cfg --address {hex(address)} --data {hex(value)}' if self.is_windows else f'./{self.inst} cfg --address {hex(address)} --data {hex(value)}'
+        return os.system(cmd)
+
+    # --- Signal Channel ---
+    def drive_signal(self, value):
+        cmd = f'{self.inst}.exe sig --data {hex(value)}' if self.is_windows else f'./{self.inst} sig --data {hex(value)}'
+        try:
+            output = subprocess.check_output(cmd, shell=True)
+            return int(output.strip(), 16) if output.strip() else None
+        except:
+            print(f"error: cannot drive signal {hex(value)}")
+            return None
+
+# -------------------------------
+# Read coefficients from CSV
+# -------------------------------
+def read_coefficients(cfg_file):
     coeffs = []
     try:
-        with open(filename, 'r') as f:
-            for line in f:
-                for x in line.replace(',', ' ').split():
-                    try:
-                        coeffs.append(float(x))
-                    except ValueError:
-                        pass  # ignore non-numeric entries
-        if not coeffs:
-            print(f"Warning: No numeric coefficients found in {filename}")
+        with open(cfg_file, 'r') as f:
+            lines = f.readlines()[1:]  # skip header
+            for line in lines:
+                parts = line.strip().split(',')
+                val_str = parts[2].strip()
+                val = int(val_str, 16) if '0x' in val_str else int(val_str)
+                coeffs.append(val & 0xFF)
+        while len(coeffs) < 4:
+            coeffs.append(0)
+        packed = (coeffs[3] << 24) | (coeffs[2] << 16) | (coeffs[1] << 8) | coeffs[0]
+        return packed
     except FileNotFoundError:
-        print(f"Error: Configuration file '{filename}' not found!")
-    return coeffs
+        print(f"error: {cfg_file} not found")
+        return 0
 
-
-# Load input signal from .vec file (handles hex like 0xd0)
-def load_vector(filename):
-    vector = []
+# -------------------------------
+# Read input vector file
+# -------------------------------
+def read_vector(vec_file):
+    vec = []
     try:
-        with open(filename, 'r') as f:
+        with open(vec_file, 'r') as f:
             for line in f:
-                for x in line.split():
-                    x = x.strip()
-                    if not x:
-                        continue
-                    try:
-                        if x.lower().startswith('0x'):
-                            vector.append(float(int(x, 16)))
-                        else:
-                            vector.append(float(x))
-                    except ValueError:
-                        pass  # ignore invalid entries
-        if not vector:
-            print(f"Warning: No valid numbers found in {filename}")
+                line = line.strip()
+                if not line:
+                    continue
+                val = int(line, 16) if '0x' in line else int(line)
+                vec.append(val & 0xFF)
+        return vec
     except FileNotFoundError:
-        print(f"Error: Input vector file '{filename}' not found!")
-    return vector
+        print(f"error: {vec_file} not found")
+        return []
+
+# -------------------------------
+# Signal processing test
+# -------------------------------
+def signal_processing_test(uad, cfg_file, vec_file):
+    print(f"\n=== Signal Processing Test with {cfg_file} ===")
+
+    # 1. Halt filter
+    uad.halt()
+    print("Filter halted.")
+
+    # 2. Load coefficients
+    coef_value = read_coefficients(cfg_file)
+    uad.write_register(0x4, coef_value)
+    print(f"Coefficients loaded: 0x{coef_value:08X}")
+
+    # 3. Clear taps
+    csr = uad.read_CSR()
+    if csr is not None:
+        uad.write_CSR(csr | (1 << 18))  # TCLR
+        print("Filter taps cleared.")
+
+    # 4. Unhalt and enable filter + all coefficients
+    csr = uad.read_CSR()
+    if csr is not None:
+        # Enable filter
+        csr |= (1 << 0)   # FEN
+
+        # Enable all coefficients
+        csr |= (1 << 1)   # C0EN
+        csr |= (1 << 2)   # C1EN
+        csr |= (1 << 3)   # C2EN
+        csr |= (1 << 4)   # C3EN
+
+        # Unhalt filter
+        csr &= ~(1 << 5)  # HALT = 0
+
+        uad.write_CSR(csr)
+        print("Filter unhalted and all coefficients enabled.")
 
 
-# Save filtered output to a file
-def save_output(output, filename):
-    try:
-        with open(filename, 'w') as f:
-            f.write(', '.join(map(str, output)))
-        print(f"Saved output to {filename}")
-    except Exception as e:
-        print(f"Error saving output: {e}")
+    # 5. Drive input vector
+    inputs = read_vector(vec_file)
+    if not inputs:
+        print("No input vector found, skipping signal drive.")
+        return []
 
+    print("\n-- Driving input signals --")
+    outputs = []
+    for val in inputs:
+        out = uad.drive_signal(val)
+        outputs.append(out)
+        print(f"Input {hex(val)} → Output {hex(out) if out is not None else 'Error'}")
 
-# -----------------------------
-# Main Task
-# -----------------------------
+    return outputs
+
+# -------------------------------
+# Main
+# -------------------------------
 if __name__ == "__main__":
-    # Initialize the filter machine (impl0)
-    impl0 = FIRFilter()
+    uad = Uad()
+    cfg_files = ["p0.cfg", "p4.cfg", "p7.cfg", "p9.cfg"]
+    vec_file = "sqr.vec"
 
-    # Load input signal
-    input_file = 'sqr.vec'  # Make sure this file exists in the same folder
-    input_signal = load_vector(input_file)
-    if not input_signal:
-        print("No input signal loaded. Exiting.")
-        exit(1)
-
-    print(f"Input signal ({len(input_signal)} samples), first 20 values: {input_signal[:20]}")
-
-    # List of configuration files
-    cfg_files = ['p0.cfg', 'p4.cfg', 'p7.cfg', 'p9.cfg']
-
-    for cfg_file in cfg_files:
-        coeffs = load_coefficients(cfg_file)
-        if not coeffs:
-            print(f"Skipping {cfg_file} due to no valid coefficients.")
-            continue
-
-        # Print loaded coefficients
-        print(f"\nUsing coefficients from {cfg_file}: {coeffs}")
-
-        impl0.set_coefficients(coeffs)
-
-        # Filter the input signal
-        output_signal = []
-        for i, sample in enumerate(input_signal):
-            y = impl0.filter(sample)
-            output_signal.append(y)
-            # Print first 10 samples to terminal
-            if i < 10:
-                print(f"x[{i}]={sample} -> y[{i}]={y}")
-
-        # Save the filtered output
-        output_filename = cfg_file.replace('.cfg', '.out')
-        save_output(output_signal, output_filename)
-
-    print("\nAll filtering done!")
+    for cfg in cfg_files:
+        outputs = signal_processing_test(uad, cfg, vec_file)
